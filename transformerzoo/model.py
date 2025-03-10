@@ -1,8 +1,8 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812
 from einops import rearrange
 from torch import nn
 
@@ -39,7 +39,7 @@ class TransformerAttention(nn.Module):
         self.w_o = nn.Linear(d_model, d_model, bias=False)
         self.norm = nn.RMSNorm(d_model)
         self.register_buffer(
-            "scale", torch.tensor(np.sqrt(d_model), dtype=torch.float32)
+            "scale", torch.tensor(np.sqrt(self.d_head), dtype=torch.float32)
         )
 
         theta = torch.pow(10000, -2 * (torch.arange(0, self.d_head) // 2) / self.d_head)
@@ -51,12 +51,21 @@ class TransformerAttention(nn.Module):
         self.sin[1::2] = -self.sin[1::2]
 
     def forward(
-        self, x: torch.tensor, attention_mask: Optional[torch.tensor] = None
-    ) -> torch.tensor:
-        b, n, _ = x.shape
+        self,
+        x: torch.tensor,
+        attention_mask: Optional[torch.tensor] = None,
+        kv_cache: Optional[torch.tensor] = None,
+    ) -> Tuple[torch.tensor, torch.tensor]:
+        n = x.shape[1] if kv_cache is None else kv_cache.shape[2] + x.shape[1]
         x_norm = self.norm(x)  # (B, N, D)
         q = self.w_q(x_norm)  # (B, N, H * A)
         k, v = self.w_k(x_norm), self.w_v(x_norm)  # (B, N, K * A)
+
+        if kv_cache is not None:
+            k = torch.cat([kv_cache[0], k], dim=1)
+            v = torch.cat([kv_cache[1], v], dim=1)
+
+        kv_cache = torch.stack([k, v])
 
         # reshaping
         q = rearrange(q, "b n (h a) -> b h n a", h=self.n_heads)
@@ -66,7 +75,10 @@ class TransformerAttention(nn.Module):
         # rotary embedding
         cos = self.cos[:n]
         sin = self.sin[:n]
-        q = q * cos + q * sin
+        if kv_cache is None:
+            q = q * cos + q * sin
+        else:
+            q = q * cos[n - 1 : n] + q * sin[n - 1 : n]
         k = k * cos + k * sin
         # matmulling
         reps = self.n_heads // self.kv_heads
@@ -74,17 +86,18 @@ class TransformerAttention(nn.Module):
         v = v.repeat(1, reps, 1, 1)
         qkt = q @ k.transpose(2, 3) / self.scale
 
-        if attention_mask is not None:
-            # Expand mask for all heads
-            expanded_mask = attention_mask.unsqueeze(1).expand(-1, self.n_heads, -1, -1)
-            qkt = qkt.masked_fill(~expanded_mask, float("-inf"))
+        if attention_mask is None and kv_cache is None:
+            attention_mask = torch.tril(torch.ones(n, n, device=x.device, dtype=bool))
+        elif attention_mask is None:
+            attention_mask = torch.ones(1, n, device=x.device, dtype=bool)
+        qkt = qkt.masked_fill(~attention_mask, float("-inf"))
 
         s = torch.softmax(qkt, dim=-1) @ v
 
         s = rearrange(s, "b h n a -> b n (h a)")
         o = self.w_o(s)
 
-        return s + o
+        return x + o, kv_cache
 
 
 class TransformerBlock(nn.Module):
@@ -101,11 +114,14 @@ class TransformerBlock(nn.Module):
         self.mlp = TransformerMLP(d_model, d_ff, use_geglu)
 
     def forward(
-        self, x: torch.tensor, attention_mask: Optional[torch.tensor] = None
-    ) -> torch.tensor:
-        x = self.attention(x, attention_mask)
+        self,
+        x: torch.tensor,
+        attention_mask: Optional[torch.tensor] = None,
+        kv_cache: Optional[torch.tensor] = None,
+    ) -> Tuple[torch.tensor, torch.tensor]:
+        x, kv_cache = self.attention(x, attention_mask, kv_cache)
         x = self.mlp(x)
-        return x
+        return x, kv_cache
 
 
 class Transformer(nn.Module):
@@ -138,11 +154,19 @@ class Transformer(nn.Module):
         self.w_proj = nn.Linear(d_model, vocab_size, bias=False)
 
     def forward(
-        self, x: torch.tensor, attention_mask: Optional[torch.tensor] = None
-    ) -> torch.tensor:
+        self,
+        x: torch.tensor,
+        attention_mask: Optional[torch.tensor] = None,
+        kv_cache: Optional[torch.tensor] = None,
+    ) -> Tuple[torch.tensor, torch.tensor]:
+        if kv_cache is not None:
+            x = x[:, -1:]
+        else:
+            kv_cache = [None] * self.n_layers
+        kv_cache_new = [None] * self.n_layers
         x = self.embedding(x)
-        for block in self.blocks:
-            x = block(x, attention_mask)
+        for i, block in enumerate(self.blocks):
+            x, kv_cache_new[i] = block(x, attention_mask, kv_cache[i])
         x = self.norm(x)
         x = self.w_proj(x)
-        return x
+        return x, torch.stack(kv_cache_new)
