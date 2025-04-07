@@ -48,7 +48,7 @@ class TransformerAttention(nn.Module):
         sin = torch.outer(torch.arange(max_seq_len), theta)
         self.register_buffer("cos", torch.cos(cos))
         self.register_buffer("sin", torch.sin(sin))
-        self.sin[1::2] = -self.sin[1::2]
+        self.sin[0::2] = -self.sin[0::2]
 
     def forward(
         self,
