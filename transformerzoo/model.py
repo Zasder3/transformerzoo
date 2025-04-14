@@ -8,14 +8,16 @@ from torch import nn
 
 
 class TransformerMLP(nn.Module):
-    def __init__(self, d_model: int, d_ff: int, use_geglu: bool):
+    def __init__(
+        self, d_model: int, d_ff: int, use_geglu: bool, norm_layer: type[nn.Module]
+    ):
         super().__init__()
         self.use_geglu = use_geglu
         self.w_up = nn.Linear(d_model, d_ff)
         self.w_down = nn.Linear(d_ff, d_model)
         if self.use_geglu:
             self.w_g = nn.Linear(d_model, d_ff)
-        self.norm = nn.RMSNorm(d_model)
+        self.norm = norm_layer(d_model)
 
     def forward(self, x: torch.tensor) -> torch.tensor:
         x_norm = self.norm(x)
@@ -28,7 +30,13 @@ class TransformerMLP(nn.Module):
 
 
 class TransformerAttention(nn.Module):
-    def __init__(self, d_model: int, n_heads: int, kv_heads: Optional[int] = None):
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        kv_heads: Optional[int] = None,
+        norm_layer: type[nn.Module] = nn.LayerNorm,
+    ):
         super().__init__()
         self.d_head = d_model // n_heads
         self.n_heads = n_heads
@@ -37,18 +45,10 @@ class TransformerAttention(nn.Module):
         self.w_k = nn.Linear(d_model, self.d_head * self.kv_heads, bias=False)
         self.w_v = nn.Linear(d_model, self.d_head * self.kv_heads, bias=False)
         self.w_o = nn.Linear(d_model, d_model, bias=False)
-        self.norm = nn.RMSNorm(d_model)
+        self.norm = norm_layer(d_model)
         self.register_buffer(
             "scale", torch.tensor(np.sqrt(self.d_head), dtype=torch.float32)
         )
-
-        theta = torch.pow(10000, -2 * (torch.arange(0, self.d_head) // 2) / self.d_head)
-        max_seq_len = 8096
-        cos = torch.outer(torch.arange(max_seq_len), theta)
-        sin = torch.outer(torch.arange(max_seq_len), theta)
-        self.register_buffer("cos", torch.cos(cos))
-        self.register_buffer("sin", torch.sin(sin))
-        self.sin[0::2] = -self.sin[0::2]
 
     def forward(
         self,
@@ -61,7 +61,8 @@ class TransformerAttention(nn.Module):
         q = self.w_q(x_norm)  # (B, N, H * A)
         k, v = self.w_k(x_norm), self.w_v(x_norm)  # (B, N, K * A)
 
-        if kv_cache is not None:
+        creating_kv_cache = kv_cache is None
+        if not creating_kv_cache:
             k = torch.cat([kv_cache[0], k], dim=1)
             v = torch.cat([kv_cache[1], v], dim=1)
 
@@ -72,21 +73,13 @@ class TransformerAttention(nn.Module):
         k = rearrange(k, "b n (k a) -> b k n a", k=self.kv_heads)
         v = rearrange(v, "b n (k a) -> b k n a", k=self.kv_heads)
 
-        # rotary embedding
-        cos = self.cos[:n]
-        sin = self.sin[:n]
-        if kv_cache is None:
-            q = q * cos + q * sin
-        else:
-            q = q * cos[n - 1 : n] + q * sin[n - 1 : n]
-        k = k * cos + k * sin
         # matmulling
         reps = self.n_heads // self.kv_heads
         k = k.repeat(1, reps, 1, 1)
         v = v.repeat(1, reps, 1, 1)
         qkt = q @ k.transpose(2, 3) / self.scale
 
-        if attention_mask is None and kv_cache is None:
+        if attention_mask is None and creating_kv_cache:
             attention_mask = torch.tril(torch.ones(n, n, device=x.device, dtype=bool))
         elif attention_mask is None:
             attention_mask = torch.ones(1, n, device=x.device, dtype=bool)
@@ -108,10 +101,11 @@ class TransformerBlock(nn.Module):
         use_geglu: bool,
         n_heads: int,
         kv_heads: Optional[int] = None,
+        norm_layer: type[nn.Module] = nn.LayerNorm,
     ):
         super().__init__()
-        self.attention = TransformerAttention(d_model, n_heads, kv_heads)
-        self.mlp = TransformerMLP(d_model, d_ff, use_geglu)
+        self.attention = TransformerAttention(d_model, n_heads, kv_heads, norm_layer)
+        self.mlp = TransformerMLP(d_model, d_ff, use_geglu, norm_layer)
 
     def forward(
         self,
@@ -134,6 +128,8 @@ class Transformer(nn.Module):
         n_layers: int,
         use_geglu: bool = True,
         kv_heads: Optional[int] = None,
+        max_seq_len: int = 2048,
+        norm_layer: type[nn.Module] = nn.LayerNorm,
     ):
         super().__init__()
         self.d_model = d_model
@@ -143,14 +139,17 @@ class Transformer(nn.Module):
         self.use_geglu = use_geglu
         self.kv_heads = n_heads if kv_heads is None else kv_heads
         self.embedding = nn.Embedding(vocab_size, d_model)
+        self.pos_embedding = nn.Parameter(torch.zeros(1, max_seq_len, d_model))
         self.blocks = nn.ModuleList(
             [
-                TransformerBlock(d_model, d_ff, use_geglu, n_heads, kv_heads)
+                TransformerBlock(
+                    d_model, d_ff, use_geglu, n_heads, kv_heads, norm_layer
+                )
                 for _ in range(n_layers)
             ]
         )
 
-        self.norm = nn.RMSNorm(d_model)
+        self.norm = norm_layer(d_model)
         self.w_proj = nn.Linear(d_model, vocab_size, bias=False)
 
     def forward(
@@ -165,6 +164,10 @@ class Transformer(nn.Module):
             kv_cache = [None] * self.n_layers
         kv_cache_new = [None] * self.n_layers
         x = self.embedding(x)
+
+        seq_len = x.shape[1]
+        x = x + self.pos_embedding[:, :seq_len, :]
+
         for i, block in enumerate(self.blocks):
             x, kv_cache_new[i] = block(x, attention_mask, kv_cache[i])
         x = self.norm(x)

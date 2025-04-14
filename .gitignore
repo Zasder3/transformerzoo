@@ -34,6 +34,7 @@ ENV/
 *.swo
 
 # Project specific
+private/
 wandb/
 .ruff_cache/
 .mypy_cache/

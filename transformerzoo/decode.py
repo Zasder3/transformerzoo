@@ -92,16 +92,23 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import pandas as pd
     import seaborn as sns
+    from tqdm import tqdm
 
     config = {
         "vocab_size": 128,
-        "d_model": 1024,
-        "d_ff": 4096,
-        "n_heads": 16,
-        "n_layers": 12,
+        "d_model": 2048,
+        "d_ff": 8192,
+        "n_heads": 32,
+        "n_layers": 24,
         "use_geglu": True,
     }
-    device = "mps" if torch.backends.mps.is_available() else "cpu"
+    device = (
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.backends.mps.is_available()
+        else "cpu"
+    )
     print("Loading model...")
     model = load_model(config, device=device)
     print("Model loaded on", device)
@@ -109,16 +116,20 @@ if __name__ == "__main__":
     prefill_text = (
         "This article is about the fascinating world of deep sea creatures. "
         "These mysterious inhabitants of the ocean depths have evolved"
-    )
+    ) * 16
+    n_decoding_tokens = 256
+    n_runs = 1
 
     # Normal decode once to warm up
-    decode(model, prefill_text, 128)
+    decode(model, prefill_text, n_decoding_tokens)
+    print("=" * 80)
+    print("Warmed up")
 
     # Time normal decoding
     normal_times = []
-    for _ in range(5):
+    for _ in tqdm(range(n_runs), desc="Normal Decoding"):
         result_normal, normal_time = decode(
-            model, prefill_text, 128, timeit=True, silent=True
+            model, prefill_text, n_decoding_tokens, timeit=True, silent=True
         )
         normal_times.append(normal_time)
     normal_times = np.array(normal_times)
@@ -127,24 +138,34 @@ if __name__ == "__main__":
 
     # Time KV cache decoding
     kv_times = []
-    for _ in range(5):
+    for _ in tqdm(range(n_runs), desc="KV Cache Decoding"):
         result_kv, kv_time = decode_kv(
-            model, prefill_text, 128, timeit=True, silent=True
+            model, prefill_text, n_decoding_tokens, timeit=True, silent=True
         )
         kv_times.append(kv_time)
     kv_times = np.array(kv_times)
     kv_mean = np.mean(np.sum(kv_times, axis=1))
     kv_std = np.std(np.sum(kv_times, axis=1))
 
+    # Time MQA decoding
+    config["kv_heads"] = 1
+    model = load_model(config, device=device)
+    mqa_times = []
+    for _ in tqdm(range(n_runs), desc="MQA + KV Cache Decoding"):
+        result_mqa, mqa_time = decode_kv(
+            model, prefill_text, n_decoding_tokens, timeit=True, silent=True
+        )
+        mqa_times.append(mqa_time)
+    mqa_times = np.array(mqa_times)
+    mqa_mean = np.mean(np.sum(mqa_times, axis=1))
+    mqa_std = np.std(np.sum(mqa_times, axis=1))
+
     print(f"Normal decode: {normal_mean:.3f} ± {normal_std:.3f} seconds")
     print(f"\nKV cache decode: {kv_mean:.3f} ± {kv_std:.3f} seconds")
+    print(f"\nMQA + KV cache decode: {mqa_mean:.3f} ± {mqa_std:.3f} seconds")
 
     # Plot the time to each token with bounds
-    # Divide first token time by length of prefill text
-    normal_times[:, 0] = normal_times[:, 0] / len(prefill_text)
-    kv_times[:, 0] = kv_times[:, 0] / len(prefill_text)
-
-    token_indices = np.arange(normal_times.shape[1]) + len(prefill_text)
+    token_indices = np.arange(normal_times.shape[1])
 
     # Create DataFrame for seaborn
     normal_df = pd.DataFrame(
@@ -165,8 +186,18 @@ if __name__ == "__main__":
         }
     )
 
+    mqa_df = pd.DataFrame(
+        {
+            "Token Index": np.tile(token_indices, mqa_times.shape[0]),
+            "Time/Token (s)": mqa_times.flatten(),
+            "Method": "MQA + KV Cache Decode",
+            "Run": np.repeat(np.arange(mqa_times.shape[0]), mqa_times.shape[1]),
+        }
+    )
+
     # Combine the dataframes
-    combined_df = pd.concat([normal_df, kv_df])
+    combined_df = pd.concat([normal_df, kv_df, mqa_df])
+    combined_df.to_csv("time_to_token.csv", index=False)
 
     # Create the plot
     sns.lineplot(
@@ -176,5 +207,8 @@ if __name__ == "__main__":
         data=combined_df,
         errorbar="sd",
     )
+    # make log log
+    plt.yscale("log")
+    plt.xscale("log")
     plt.savefig("time_to_token.png")
     plt.show()
